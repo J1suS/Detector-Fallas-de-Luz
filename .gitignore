@@ -1,0 +1,20 @@
+# Arduino IDE — archivos temporales de compilación
+build/
+.arduino15/
+*.elf
+*.bin
+*.hex
+*.map
+
+# Caché del IDE
+.cache/
+**/.cache/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Credenciales
+secrets.h
+credentials.h 
