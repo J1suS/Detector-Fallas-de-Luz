@@ -1,7 +1,13 @@
 /*
  * ============================================================
   DETECTOR DE FALLA DE LUZ - VENEZUELA
-  Versión: 1.0 - Validación USB (alimentación por USB)
+  Versión: 2.0 - Detección instantánea, sin delays bloqueantes
+
+  Cambios respecto a v1.0:
+  - Eliminado debounce: detección al instante del corte
+  - Eliminados todos los delay() del loop principal
+  - Envío a Google Sheets desacoplado de la detección
+  - Contador arranca en el preciso momento de la falla
 
   Hardware:
   - Arduino ESP32C3 Super Mini
@@ -17,7 +23,7 @@
   Ing. de Sistemas
   UNEFA
  * ============================================================
- */
+*/
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -26,7 +32,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <time.h>
-#include "secrets.h"   // ← por mi seguridad :v
+#include "secrets.h"
 
 // ============================================================
 //  CONFIGURACIÓN
@@ -37,7 +43,7 @@
 
 // NTP - zona horaria Venezuela = UTC-4
 const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_S = -4 * 3600;   // UTC-4
+const long  GMT_OFFSET_S = -4 * 3600;
 const int   DST_OFFSET_S = 0;
 
 // ============================================================
@@ -52,15 +58,15 @@ const int   DST_OFFSET_S = 0;
 #define OLED_ADDR 0x3C
 
 /*
-SENSOR DE VOLTAJE:
+ SENSOR DE VOLTAJE:
   - Fase real:   salida digital del ZMPT101B (HIGH = hay luz, LOW = sin luz)
   - Fase prueba: cable jumper entre GPIO3 y GND
 
-  Para simular falla: conectar el cable a una linea GND
+  Para simular falla:   conectar el cable a una línea GND
   Para simular retorno: desconectar cable
 */
 
-#define PIN_SENSOR 3 // GPIO3
+#define PIN_SENSOR 3   // GPIO3
 
 // LED interno del ESP32C3 Super Mini
 #define PIN_LED 2
@@ -68,28 +74,33 @@ SENSOR DE VOLTAJE:
 // ============================================================
 //  CONSTANTES
 // ============================================================
-#define DEBOUNCE_MS 2000 // ms para confirmar cambio de estado (evitar falsos)
-#define RECONNECT_TIMEOUT 15000  // ms máximo esperando reconexión WiFi
-#define OLED_UPDATE_MS 1000 // actializa pantalla cada 1 segundo
+#define RECONNECT_TIMEOUT 15000 // ms máximo esperando reconexión WiFi
+#define OLED_UPDATE_MS 1000 // actualiza pantalla cada 1 segundo
 
 // ============================================================
 //  VARIABLES GLOBALES
 // ============================================================
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
 
-bool luzPresente = true; // estado actual de la red eléctrica
-bool estadoAnterior = true; // para detectar cambios
-unsigned long tiempoFalla = 0; // millis() cuando se fue la luz
-unsigned long duracionFalla = 0; // duración de la última falla en segundos
+// Estado del sensor
+bool luzPresente = true;
+bool lecturaAnterior = true;
 
-unsigned long ultimoDisplayUpdate = 0;
-unsigned long ultimoDebounce = 0;
-bool estadoPendiente = false;
-bool nuevoEstadoPendiente = false;
+// Temporización
+unsigned long tiempoFalla = 0; // millis() exacto del corte
+unsigned long duracionFalla = 0; // duración de última falla en segundos
+unsigned long ultimoDisplay = 0;
+unsigned long ultimoEnvio = 0;
 
-int contadorFallas = 0; // fallas en esta sesión
-String horaFalla = ""; // timestamp de inicio de falla
-String horaRetorno = ""; // timestamp de retorno
+// Banderas de envío
+bool envioFallaPendiente = false;
+bool envioRetornoPendiente = false;
+
+// Datos del evento actual
+int contadorFallas = 0;
+String horaFalla = "";
+String horaRetorno = "";
+String duracionStr = "";
 
 // ============================================================
 //  PROTOTIPOS
@@ -97,10 +108,9 @@ String horaRetorno = ""; // timestamp de retorno
 void conectarWiFi();
 bool enviarAGoogleSheets(String tipo, String hora, String duracion, String notas);
 String obtenerHora();
+String segundosAHMS(unsigned long seg);
 void mostrarEstado();
 void mostrarMensaje(String linea1, String linea2 = "", String linea3 = "");
-void procesarCambioEstado(bool nuevaLuz);
-String segundosAHMS(unsigned long seg);
 
 // ============================================================
 //  SETUP
@@ -108,39 +118,31 @@ String segundosAHMS(unsigned long seg);
 void setup()
 {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n\n=== DETECTOR DE FALLA DE LUZ ===");
+  delay(300);
+  Serial.println("\n\n=== DETECTOR DE FALLA DE LUZ v2.0 ===");
 
-  // I2C para OLED
+  // I2C y OLED
   Wire.begin(OLED_SDA, OLED_SCL);
 
-  // Iniciar OLED
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
   {
     Serial.println("[ERROR] OLED no encontrada");
   }
-  else
-  {
-    Serial.println("[OK] OLED inicializada");
-    mostrarMensaje("Iniciando...", "Detector de Luz", "v1.0");
-    delay(1500);
-  }
 
-  // Configurar pin del sensor/botón
+  // Sensor
   pinMode(PIN_SENSOR, INPUT_PULLUP);
 
-  // Conectar WiFi
+  // WiFi
   mostrarMensaje("Conectando", "WiFi...", WIFI_SSID);
   conectarWiFi();
 
-  // Sincronizar hora NTP
+  // NTP
   mostrarMensaje("Sincronizando", "hora NTP...", "");
   configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
 
-  // Esperar hasta obtener hora válida
   Serial.print("[NTP] Esperando sincronización");
-  int intentosNTP = 0;
   struct tm timeinfo;
+  int intentosNTP = 0;
 
   while (!getLocalTime(&timeinfo) && intentosNTP < 20)
   {
@@ -158,137 +160,86 @@ void setup()
     Serial.println("\n[WARN] Sin hora NTP, usando millis()");
   }
 
-  // Leer estado inicial del sensor
-  luzPresente = (digitalRead(PIN_SENSOR) == HIGH);
-  estadoAnterior = luzPresente;
+  // Estado inicial del sensor
+  lecturaAnterior = (digitalRead(PIN_SENSOR) == HIGH);
+  luzPresente     = lecturaAnterior;
 
-  mostrarMensaje("Sistema listo", luzPresente ? "Luz: PRESENTE" : "Luz: AUSENTE", "");
-  delay(1500);
-
-  ultimoDisplayUpdate = 0; // Forzar actualización inmediata
+  Serial.println("[OK] Sistema listo. Sensor: " + String(luzPresente ? "LUZ" : "SIN LUZ"));
   mostrarEstado();
-
-  Serial.println("[OK] Sistema listo. Estado inicial: " + String(luzPresente ? "LUZ" : "SIN LUZ"));
 }
 
 // ============================================================
-//  LOOP PRINCIPAL
+//  LOOP PRINCIPAL — sin delays bloqueantes
 // ============================================================
 void loop()
 {
-  bool lecturaSensor = (digitalRead(PIN_SENSOR) == HIGH); // HIGH = hay luz
+  unsigned long ahora = millis();
 
-  // Detección de cambio con debounce
-  if (lecturaSensor != luzPresente)
-  {
-    if (!estadoPendiente)
-    {
-      estadoPendiente    = true;
-      nuevoEstadoPendiente = lecturaSensor;
-      ultimoDebounce     = millis();
-    }
-    else if (lecturaSensor == nuevoEstadoPendiente && (millis() - ultimoDebounce) >= DEBOUNCE_MS)
-    {
-      // Cambio confirmado
-      estadoPendiente = false;
-      procesarCambioEstado(lecturaSensor);
-    }
-    else if (lecturaSensor != nuevoEstadoPendiente)
-    {
-      // Fluctuación, resetear debounce
-      estadoPendiente = false;
-    }
-  }
-  else
-  {
-    estadoPendiente = false;
-  }
+  // LEER SENSOR
+  bool lecturaActual = (digitalRead(PIN_SENSOR) == HIGH);
 
-  // Actualizar pantalla cada segundo
-  if (millis() - ultimoDisplayUpdate >= OLED_UPDATE_MS)
+  if (lecturaActual != lecturaAnterior)
   {
-    ultimoDisplayUpdate = millis();
+    lecturaAnterior = lecturaActual;
+    luzPresente     = lecturaActual;
+
+    if (!lecturaActual)
+    {
+      // SE FUE LA LUZ
+      tiempoFalla   = ahora;          // captura exacta del instante
+      horaFalla     = obtenerHora();
+      duracionFalla = 0;
+      contadorFallas++;
+
+      Serial.println("\n[FALLA] " + horaFalla + " | Falla #" + String(contadorFallas));
+
+      envioFallaPendiente   = true;
+      envioRetornoPendiente = false;
+    }
+    else
+    {
+      // VOLVIÓ LA LUZ
+      duracionFalla = (ahora - tiempoFalla) / 1000;
+      horaRetorno   = obtenerHora();
+      duracionStr   = segundosAHMS(duracionFalla);
+
+      Serial.println("\n[RETORNO] " + horaRetorno + " | Duración: " + duracionStr);
+
+      envioRetornoPendiente = true;
+      envioFallaPendiente   = false;
+    }
+
+    // Actualizar pantalla inmediatamente al cambiar estado
     mostrarEstado();
   }
 
-  delay(50);
-}
-
-// ============================================================
-//  PROCESAR CAMBIO DE ESTADO
-// ============================================================
-void procesarCambioEstado(bool nuevaLuz)
-{
-  luzPresente = nuevaLuz;
-  String hora = obtenerHora();
-
-  if (!nuevaLuz)
+  // ENVÍO A GOOGLE SHEETS
+  if (envioFallaPendiente && WiFi.status() == WL_CONNECTED)
   {
-    //SE FUE LA LUZ
-    contadorFallas++;
-    tiempoFalla = millis();
-    horaFalla   = hora;
-    duracionFalla = 0;
-
-    Serial.println("\n[FALLA] Corte detectado a las " + hora);
-    Serial.println("[INFO] Falla #" + String(contadorFallas) + " en esta sesión");
-
-    mostrarMensaje("! FALLA DE LUZ !", hora, "Registrando...");
-
-    // Reconectar WiFi si es necesario
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      Serial.println("[WiFi] Reconectando...");
-      conectarWiFi();
-    }
-
-    // Enviar registro de inicio de falla
-    bool ok = enviarAGoogleSheets("FALLA_INICIO", hora, "0", "Falla #" + String(contadorFallas));
-
-    if (ok)
-    {
-      Serial.println("[OK] Falla registrada en Google Sheets");
-      mostrarMensaje("! SIN LUZ !", "Registrado OK", hora);
-    }
-    else
-    {
-      Serial.println("[ERROR] No se pudo registrar. Reintentando en loop...");
-      mostrarMensaje("! SIN LUZ !", "Error al enviar", "Reintentando...");
-      // Podrías guardar en EEPROM aquí para mayor robustez
-    }
-
+    envioFallaPendiente = false;
+    bool ok = enviarAGoogleSheets("FALLA_INICIO", horaFalla, "0", "Falla #" + String(contadorFallas));
+    Serial.println(ok ? "[OK] Falla enviada a Sheets" : "[ERROR] Falla no enviada");
   }
-  else
+
+  if (envioRetornoPendiente && WiFi.status() == WL_CONNECTED)
   {
-    //VOLVIÓ LA LUZ
-    horaRetorno   = hora;
-    duracionFalla = (millis() - tiempoFalla) / 1000; // en segundos
-    String durStr = segundosAHMS(duracionFalla);
+    envioRetornoPendiente = false;
+    bool ok = enviarAGoogleSheets("FALLA_FIN", horaRetorno, String(duracionFalla), "Dur: " + duracionStr + " | Inicio: " + horaFalla);
+    Serial.println(ok ? "[OK] Retorno enviado a Sheets" : "[ERROR] Retorno no enviado");
+  }
 
-    Serial.println("\n[RETORNO] Luz restaurada a las " + hora);
-    Serial.println("[INFO] Duración de falla: " + durStr);
+  // Reintentar WiFi cada 30 segundos si no hay conexión
+  if (WiFi.status() != WL_CONNECTED && (ahora - ultimoEnvio > 30000))
+  {
+    ultimoEnvio = ahora;
+    conectarWiFi();
+  }
 
-    mostrarMensaje("RETORNO LUZ", hora, "Dur: " + durStr);
-
-    // Reconectar WiFi si es necesario
-    if (WiFi.status() != WL_CONNECTED)
-    {
-      conectarWiFi();
-    }
-
-    // Enviar registro de fin de falla
-    bool ok = enviarAGoogleSheets("FALLA_FIN", hora, String(duracionFalla), "Duracion: " + durStr + " | Inicio: " + horaFalla);
-
-    if (ok)
-    {
-      Serial.println("[OK] Retorno registrado en Google Sheets");
-      mostrarMensaje("LUZ PRESENTE", "Registrado OK", "Dur: " + durStr);
-    }
-    else
-    {
-      Serial.println("[ERROR] No se pudo registrar retorno.");
-      mostrarMensaje("LUZ PRESENTE", "Error al enviar", "Dur: " + durStr);
-    }
+  // --- 3. ACTUALIZAR PANTALLA CADA SEGUNDO ---
+  if (ahora - ultimoDisplay >= OLED_UPDATE_MS)
+  {
+    ultimoDisplay = ahora;
+    mostrarEstado();
   }
 }
 
@@ -304,18 +255,15 @@ bool enviarAGoogleSheets(String tipo, String hora, String duracion, String notas
   }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Para HTTPS sin validar certificado (suficiente para este uso)
+  client.setInsecure();
 
   HTTPClient http;
 
-  // Construir URL con parámetros GET
   String url = String(GOOGLE_SCRIPT_URL);
   url += "?tipo="     + tipo;
   url += "&hora="     + hora;
   url += "&duracion=" + duracion;
   url += "&notas="    + notas;
-
-  // Reemplazar espacios por %20
   url.replace(" ", "%20");
 
   Serial.println("[HTTP] Enviando a: " + url.substring(0, 60) + "...");
@@ -387,7 +335,7 @@ String obtenerHora()
     sprintf(buf, "T+%02lu:%02lu:%02lu", s/3600, (s%3600)/60, s%60);
     return String(buf);
   }
-  
+
   char buf[25];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
   return String(buf);
@@ -407,7 +355,7 @@ String segundosAHMS(unsigned long seg)
 }
 
 // ============================================================
-//  MOSTRAR ESTADO EN OLED (actualización periódica)
+//  MOSTRAR ESTADO EN OLED
 // ============================================================
 void mostrarEstado()
 {
@@ -416,8 +364,8 @@ void mostrarEstado()
 
   if (!luzPresente)
   {
-    //PANTALLA DE FALLA
-    
+    // PANTALLA DE FALLA
+
     // Título parpadeante
     static bool parpadeo = false;
     parpadeo = !parpadeo;
@@ -425,7 +373,7 @@ void mostrarEstado()
     display.setCursor(0, 0);
     if (parpadeo) display.println("!!! SIN LUZ !!!");
 
-    // Contador de segundos
+    // Contador HH:MM:SS en tamaño grande
     unsigned long durActual = (millis() - tiempoFalla) / 1000;
     unsigned long h = durActual / 3600;
     unsigned long m = (durActual % 3600) / 60;
@@ -433,35 +381,33 @@ void mostrarEstado()
 
     display.setTextSize(2);
     display.setCursor(0, 16);
-    char buf[12];
+    char buf[9];
     sprintf(buf, "%02lu:%02lu:%02lu", h, m, s);
     display.println(buf);
 
-    // Hora de inicio de falla
     display.setTextSize(1);
     display.setCursor(0, 40);
     display.print("Desde: ");
 
     if (horaFalla.length() >= 19)
     {
-      display.println(horaFalla.substring(11, 16)); // HH:MM
+      display.println(horaFalla.substring(11, 16));   // HH:MM
     }
     else
     {
       display.println(horaFalla);
     }
 
-    // Falla número
     display.setCursor(0, 52);
     display.print("Falla #");
-    display.println(contadorFallas);
-
+    display.print(contadorFallas);
+    display.print("  ");
+    display.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "Sin WiFi");
   }
   else
   {
-    //PANTALLA NORMAL
+    // PANTALLA NORMAL
 
-    // Estado
     display.setTextSize(1);
     display.setCursor(4, 0);
     display.println(" HAY ELECTRICIDAD ");
@@ -473,15 +419,16 @@ void mostrarEstado()
     if (hora.length() >= 19)
     {
       display.setTextSize(1);
-      display.println(hora.substring(11)); // HH:MM:SS
+      display.println(hora.substring(11));   // HH:MM:SS
     }
     else
     {
-      display.println(hora); // fallback T+xx:xx:xx si no hay NTP
+      display.println(hora);   // fallback T+xx:xx:xx si no hay NTP
     }
 
     // Última falla y su duración
     display.setCursor(0, 30);
+
     if (horaFalla != "" && duracionFalla > 0)
     {
       display.print("Ult falla: ");
@@ -496,8 +443,8 @@ void mostrarEstado()
       }
 
       display.setCursor(0, 42);
-      display.print("Duracion: ");
-      display.println(segundosAHMS(duracionFalla));
+      display.print("Duracion:  ");
+      display.println(duracionStr);
     }
     else
     {
@@ -522,9 +469,10 @@ void mostrarEstado()
 }
 
 // ============================================================
-//  MOSTRAR MENSAJE A OLED
+//  MOSTRAR MENSAJE EN OLED
 // ============================================================
-void mostrarMensaje(String linea1, String linea2, String linea3) {
+void mostrarMensaje(String linea1, String linea2, String linea3)
+{
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
