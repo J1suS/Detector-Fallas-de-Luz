@@ -1,25 +1,19 @@
 /*
  * ============================================================
   DETECTOR DE FALLA DE LUZ - VENEZUELA
-  Versión: 3.0 - Guardado local NVS + sincronización automática
+  Versión: 3.1 - Integración de batería 18659 + TP4056
 
-  Cambios respecto a v2.0:
-  - Guardado local en memoria NVS (persiste sin internet)
-  - Sincronización automática al recuperar WiFi
-  - Contador de fallas históricas (sobrevive reinicios)
-  - OLED muestra registros pendientes por sincronizar
-
-  Flujo de datos:
-  1. Falla detectada  → guardar en NVS (siempre, primero)
-  2. Si hay WiFi      → enviar a Google Sheets inmediatamente
-  3. Sin WiFi         → queda pendiente en NVS
-  4. WiFi recuperado  → sincronizar todos los pendientes
+  Cambios respecto a v3.0:
+  - Alimentación autónoma por batería 18650 vía TP4056
+  - Validada la autonomía sin conexión USB
 
   Hardware:
   - Arduino ESP32C3 Super Mini
-  - Sensor ZMPT101B  (en esta fase: simulado con cable jumper)
+  - Batería LiPo 18650 3000mAh conectada via JST
+  - Módulo TP4056 con protección
+  - Sensor ZMPT101B  (simulado con cable jumper)
   - Pantalla OLED 0.96" SSD1306 via I2C
-  - Conexión WiFi (actualmente router)
+  - Conexión WiFi (actualmente router) [pendiente el BAM USB]
 
   Servicios externos:
   - Google Sheets (via Google Apps Script Web App)
@@ -46,9 +40,9 @@
 // ============================================================
 
 // WIFI_SSID, WIFI_PASSWORD y GOOGLE_SCRIPT_URL
-// vienen definidos en secrets.h
+// definidos en secrets.h
 
-// NTP - zona horaria Venezuela = UTC-4
+// zona horaria = UTC-4
 const char* NTP_SERVER   = "pool.ntp.org";
 const long  GMT_OFFSET_S = -4 * 3600;
 const int   DST_OFFSET_S = 0;
@@ -137,7 +131,7 @@ void setup()
 {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n\n=== DETECTOR DE FALLA DE LUZ v3.0 ===");
+  Serial.println("\n\n=== DETECTOR DE FALLA DE LUZ v3.1 ===");
 
   // I2C y OLED
   Wire.begin(OLED_SDA, OLED_SCL);
@@ -196,12 +190,12 @@ void setup()
   lecturaAnterior = (digitalRead(PIN_SENSOR) == HIGH);
   luzPresente     = lecturaAnterior;
 
-  Serial.println("[OK] Sistema listo. Sensor: " + String(luzPresente ? "LUZ" : "SIN LUZ"));
+  Serial.println("[OK] Sistema listo. Sensor: " + String(luzPresente ? "LUZ" : "SIN ELECTRICIDAD"));
   mostrarEstado();
 }
 
 // ============================================================
-//  LOOP PRINCIPAL — sin delays
+//  LOOP PRINCIPAL
 // ============================================================
 void loop()
 {
@@ -213,13 +207,13 @@ void loop()
   if (lecturaActual != lecturaAnterior)
   {
     lecturaAnterior = lecturaActual;
-    luzPresente     = lecturaActual;
+    luzPresente = lecturaActual;
 
     if (!lecturaActual)
     {
       // SE FUE LA LUZ
-      tiempoFalla   = ahora;
-      horaFalla     = obtenerHora();
+      tiempoFalla = ahora;
+      horaFalla = obtenerHora();
       duracionFalla = 0;
       contadorFallas++;
       nvs.putInt("fallasTot", contadorFallas);
@@ -229,15 +223,15 @@ void loop()
       // Guardar en NVS primero, antes de cualquier otra cosa
       guardarEnNVS("FALLA_INICIO", horaFalla, 0, "Falla #" + String(contadorFallas));
 
-      envioFallaPendiente   = true;
+      envioFallaPendiente = true;
       envioRetornoPendiente = false;
     }
     else
     {
       // VOLVIÓ LA LUZ
       duracionFalla = (ahora - tiempoFalla) / 1000;
-      horaRetorno   = obtenerHora();
-      duracionStr   = segundosAHMS(duracionFalla);
+      horaRetorno = obtenerHora();
+      duracionStr = segundosAHMS(duracionFalla);
 
       Serial.println("\n[RETORNO] " + horaRetorno + " | Duración: " + duracionStr);
 
@@ -245,7 +239,7 @@ void loop()
       guardarEnNVS("FALLA_FIN", horaRetorno, duracionFalla, "Dur: " + duracionStr + " | Inicio: " + horaFalla);
 
       envioRetornoPendiente = true;
-      envioFallaPendiente   = false;
+      envioFallaPendiente = false;
     }
 
     // Actualizar pantalla inmediatamente al cambiar estado
@@ -318,7 +312,7 @@ void loop()
 }
 
 // ============================================================
-//  GUARDAR REGISTRO EN NVS
+//  GUARDAR REGISTRO NVS
 // ============================================================
 void guardarEnNVS(String tipo, String hora, unsigned long durSeg, String notas)
 {
@@ -326,7 +320,7 @@ void guardarEnNVS(String tipo, String hora, unsigned long durSeg, String notas)
 
   if (total >= MAX_REGISTROS)
   {
-    // Buffer lleno: desplazar registros (borrar el más antiguo)
+    // desplazar registros (borrar el más antiguo)
     Serial.println("[NVS] Buffer lleno, descartando registro más antiguo");
 
     for (int i = 0; i < MAX_REGISTROS - 1; i++)
@@ -422,7 +416,7 @@ void sincronizarPendientes()
 // ============================================================
 int contarPendientes()
 {
-  int total      = nvs.getInt("total", 0);
+  int total = nvs.getInt("total", 0);
   int pendientes = 0;
 
   for (int i = 0; i < total; i++)
@@ -460,10 +454,10 @@ bool enviarAGoogleSheets(String tipo, String hora, String duracion, String notas
   HTTPClient http;
 
   String url = String(GOOGLE_SCRIPT_URL);
-  url += "?tipo="     + tipo;
-  url += "&hora="     + hora;
+  url += "?tipo=" + tipo;
+  url += "&hora=" + hora;
   url += "&duracion=" + duracion;
-  url += "&notas="    + notas;
+  url += "&notas=" + notas;
   url.replace(" ", "%20");
 
   Serial.println("[HTTP] Enviando a: " + url.substring(0, 60) + "...");
@@ -560,7 +554,6 @@ String segundosAHMS(unsigned long seg)
 void mostrarEstado()
 {
   display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
 
   if (!luzPresente)
   {
@@ -571,6 +564,7 @@ void mostrarEstado()
     parpadeo = !parpadeo;
     display.setTextSize(1);
     display.setCursor(0, 0);
+
     if (parpadeo) display.println("!!! SIN LUZ !!!");
 
     // Contador HH:MM:SS en tamaño grande
@@ -610,7 +604,7 @@ void mostrarEstado()
     }
     else
     {
-      display.println(WiFi.status() == WL_CONNECTED ? "WiFi OK" : "Sin WiFi");
+      display.println(WiFi.status() == WL_CONNECTED ? "WiFi SI" : "Sin WiFi");
     }
   }
   else
