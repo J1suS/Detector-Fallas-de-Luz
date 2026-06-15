@@ -1,29 +1,53 @@
 /*
  * ============================================================
- *  DETECTOR DE FALLA DE LUZ - VENEZUELA
- *  Versión: 3.2 - Primer test con el sensor ZMPT101B
- *
- *  Cambios respecto a v3.1:
- *  - Integración del módulo ZMPT101B código de prueba
- *    (sin batería ni TP4056 funcionando)
- *
- *  Hardware:
- *  - Arduino ESP32C3 Super Mini
- *  - Batería Li-ion 18650 3000mAh via JST   (deshabilitado)
- *  - Módulo TP4056 con protección            (deshabilitado)
- *  - Sensor ZMPT101B (VCC → 3V3, OUT → GPIO3)
- *  - Pantalla OLED 0.96" SSD1306 via I2C
- *  - Conexión WiFi: router local
- *
- *  Jesús Rivas && Sofía Karabin
- *  Ing. de Sistemas
- *  UNEFA
+  DETECTOR DE FALLA DE LUZ - VENEZUELA
+  Versión: 4.0 - Integración completa sensor ZMPT101B
+
+  Cambios respecto a v3.1:
+  - Reemplazado cable jumper por sensor ZMPT101B real
+  - Detección por amplitud de oscilación de señal AC
+  - Muestras durante 100ms para calcular variación ADC
+  - Umbral de 100 ADC (sin luz ~20, con luz ~800)
+
+  Hardware:
+  - Arduino ESP32C3 Super Mini
+  - Módulo TP4056 con protección (OUT+ → 5V, OUT- → GND)
+  - Batería Li-ion 18650 3000mAh conectada via JST
+  - Sensor ZMPT101B (VCC → 3V3, GND → GND, OUT → GPIO3)
+  - Pantalla OLED 0.96" SSD1306 via I2C
+  - Conexión WiFi: router local [pendiente BAM USB]
+
+  Servicios externos:
+  - Google Sheets (via Google Apps Script Web App)
+  - NTP para hora exacta
+
+  Jesús Rivas && Sofía Karabin
+  Ing. de Sistemas
+  UNEFA
  * ============================================================
  */
 
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Preferences.h>
+#include <time.h>
+#include "secrets.h"
+
+// ============================================================
+//  CONFIGURACIÓN
+// ============================================================
+
+// WIFI_SSID, WIFI_PASSWORD y GOOGLE_SCRIPT_URL
+// definidos en secrets.h
+
+// zona horaria = UTC-4
+const char* NTP_SERVER   = "pool.ntp.org";
+const long  GMT_OFFSET_S = -4 * 3600;
+const int   DST_OFFSET_S = 0;
 
 // ============================================================
 //  PINES
@@ -36,20 +60,72 @@
 #define SCREEN_H  64
 #define OLED_ADDR 0x3C
 
-#define PIN_SENSOR 3   // GPIO3 → OUT del ZMPT101B
+// ZMPT101B
+#define PIN_SENSOR 3 // GPIO3 → OUT del sensor
+
+// ============================================================
+//  CONSTANTES
+// ============================================================
+#define RECONNECT_TIMEOUT 15000 // ms máximo esperando reconexión WiFi
+#define OLED_UPDATE_MS    1000 // actualiza pantalla cada 1 segundo
+#define MAX_REGISTROS     60 // máximo de registros en NVS sin sincronizar
+
+// Detección por amplitud de oscilación
+#define TIEMPO_MUESTRAS   100 // ms de muestreo para calcular amplitud
+#define UMBRAL_AMPLITUD   400 // ADC mínimo para considerar que hay luz
+// (sin luz ~20, con luz ~800)
 
 // ============================================================
 //  VARIABLES GLOBALES
 // ============================================================
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
+Preferences nvs;
 
-int   valorADC  = 0;
-float voltajeSalida = 0.0;
+// Estado del sensor
+bool luzPresente = true;
+bool lecturaAnterior = true;
+
+// Temporización
+unsigned long tiempoFalla = 0;
+unsigned long duracionFalla = 0;
+unsigned long ultimoDisplay = 0;
+unsigned long ultimoWifiCheck = 0;
+unsigned long ultimoSync = 0;
+unsigned long ultimoMuestreo = 0;
+
+// Banderas de envío
+bool envioFallaPendiente = false;
+bool envioRetornoPendiente = false;
+
+// Datos del evento actual
+int    contadorFallas = 0;
+String horaFalla = "";
+String horaRetorno = "";
+String duracionStr = "";
+
+// Estado de sincronización
+int  pendientesEnNVS = 0;
+bool sincronizando = false;
+
+// Muestreo del sensor
+int valorMaxADC = 0;
+int valorMinADC = 4095;
+int amplitudADC = 0;
 
 // ============================================================
 //  PROTOTIPOS
 // ============================================================
-void mostrarEstado();
+void   conectarWiFi();
+bool   enviarAGoogleSheets(String tipo, String hora, String duracion, String notas);
+void   guardarEnNVS(String tipo, String hora, unsigned long durSeg, String notas);
+void   sincronizarPendientes();
+int    contarPendientes();
+void   cargarContadores();
+bool   medirLuz();
+String obtenerHora();
+String segundosAHMS(unsigned long seg);
+void   mostrarEstado();
+void   mostrarMensaje(String linea1, String linea2 = "", String linea3 = "");
 
 // ============================================================
 //  SETUP
@@ -58,10 +134,11 @@ void setup()
 {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n\n=== TEST DE SENSOR v3.2 ===");
+  Serial.println("\n\n=== DETECTOR DE FALLA DE LUZ v4.0 ===");
 
-  analogReadResolution(12);   // ADC de 12 bits (0-4095)
+  analogReadResolution(12); // ADC 12 bits (0-4095)
 
+  // I2C y OLED
   Wire.begin(OLED_SDA, OLED_SCL);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR))
@@ -70,34 +147,434 @@ void setup()
   }
   else
   {
-    display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
-    display.setTextSize(1);
-    display.setCursor(0, 20);
-    display.println("Iniciando sensor...");
-    display.display();
-    Serial.println("[OK] OLED inicializada");
-    delay(1000);
+  }
+
+  // NVS — cargar datos persistidos de sesiones anteriores
+  nvs.begin("falluzvzla", false);
+  cargarContadores();
+  pendientesEnNVS = contarPendientes();
+  Serial.println("[NVS] Registros totales: " + String(nvs.getInt("total", 0)));
+  Serial.println("[NVS] Pendientes: " + String(pendientesEnNVS));
+
+  // WiFi
+  mostrarMensaje("Conectando", "WiFi...", WIFI_SSID);
+  conectarWiFi();
+
+  // NTP
+  mostrarMensaje("Sincronizando", "hora NTP...", "");
+  configTime(GMT_OFFSET_S, DST_OFFSET_S, NTP_SERVER);
+
+  Serial.print("[NTP] Esperando sincronización");
+  struct tm timeinfo;
+  int intentosNTP = 0;
+
+  while (!getLocalTime(&timeinfo) && intentosNTP < 20)
+  {
+    Serial.print(".");
+    delay(500);
+    intentosNTP++;
+  }
+
+  if (intentosNTP < 20)
+  {
+    Serial.println("\n[OK] Hora sincronizada: " + obtenerHora());
+  }
+  else
+  {
+    Serial.println("\n[WARN] Sin hora NTP, usando millis()");
+  }
+
+  // Sincronizar pendientes al arrancar si hay WiFi
+  if (WiFi.status() == WL_CONNECTED && pendientesEnNVS > 0)
+  {
+    mostrarMensaje("Sincronizando", String(pendientesEnNVS) + " pendientes", "espera...");
+    sincronizarPendientes();
+  }
+
+  // Lectura inicial del sensor
+  lecturaAnterior = medirLuz();
+  luzPresente     = lecturaAnterior;
+
+  Serial.println("[SENSOR] Amplitud inicial: " + String(amplitudADC));
+  Serial.println("[OK] Sistema listo. Estado: " + String(luzPresente ? "LUZ" : "SIN LUZ"));
+  mostrarEstado();
+}
+
+// ============================================================
+//  LOOP PRINCIPAL — sin delays bloqueantes
+// ============================================================
+void loop()
+{
+  unsigned long ahora = millis();
+
+  // MEDIR SENSOR (cada 100ms)
+  bool lecturaActual = medirLuz();
+  Serial.println("[SENSOR] Amplitud: " + String(amplitudADC) + " | Estado: " + String(lecturaActual ? "LUZ" : "SIN LUZ"));
+  
+
+  if (lecturaActual != lecturaAnterior)
+  {
+    lecturaAnterior = lecturaActual;
+    luzPresente = lecturaActual;
+
+    if (!lecturaActual)
+    {
+      // SE FUE LA LUZ
+      tiempoFalla = ahora;
+      horaFalla = obtenerHora();
+      duracionFalla = 0;
+      contadorFallas++;
+      nvs.putInt("fallasTot", contadorFallas);
+
+      Serial.println("\n[FALLA] " + horaFalla + " | Falla #" + String(contadorFallas));
+      Serial.println("[SENSOR] Amplitud: " + String(amplitudADC));
+
+      // Guardar en NVS primero
+      guardarEnNVS("FALLA_INICIO", horaFalla, 0, "Falla #" + String(contadorFallas));
+
+      envioFallaPendiente = true;
+      envioRetornoPendiente = false;
+    }
+    else
+    {
+      // VOLVIÓ LA LUZ
+      duracionFalla = (ahora - tiempoFalla) / 1000;
+      horaRetorno = obtenerHora();
+      duracionStr = segundosAHMS(duracionFalla);
+
+      Serial.println("\n[RETORNO] " + horaRetorno + " | Duración: " + duracionStr);
+      Serial.println("[SENSOR] Amplitud: " + String(amplitudADC));
+
+      // Guardar en NVS primero
+      guardarEnNVS("FALLA_FIN", horaRetorno, duracionFalla, "Dur: " + duracionStr + " | Inicio: " + horaFalla);
+
+      envioRetornoPendiente = true;
+      envioFallaPendiente   = false;
+    }
+
+    mostrarEstado();
+  }
+
+  // ENVÍO INMEDIATO SI HAY WIFI
+  if (envioFallaPendiente && WiFi.status() == WL_CONNECTED)
+  {
+    envioFallaPendiente = false;
+    int idx = nvs.getInt("total", 1) - 1;
+    bool ok = enviarAGoogleSheets("FALLA_INICIO", horaFalla, "0", "Falla #" + String(contadorFallas));
+
+    if (ok)
+    {
+      String key = "env" + String(idx);
+      nvs.putBool(key.c_str(), true);
+      pendientesEnNVS = contarPendientes();
+      Serial.println("[OK] Falla enviada y marcada en NVS");
+    }
+    else
+    {
+      Serial.println("[WARN] Sin internet, quedó guardada en NVS");
+    }
+  }
+
+  if (envioRetornoPendiente && WiFi.status() == WL_CONNECTED)
+  {
+    envioRetornoPendiente = false;
+    int idx = nvs.getInt("total", 1) - 1;
+    bool ok = enviarAGoogleSheets("FALLA_FIN", horaRetorno, String(duracionFalla), "Dur: " + duracionStr + " | Inicio: " + horaFalla);
+
+    if (ok)
+    {
+      String key = "env" + String(idx);
+      nvs.putBool(key.c_str(), true);
+      pendientesEnNVS = contarPendientes();
+      Serial.println("[OK] Retorno enviado y marcado en NVS");
+    }
+    else
+    {
+      Serial.println("[WARN] Sin internet, quedó guardada en NVS");
+    }
+  }
+
+  // Verificar WiFi cada 30 segundos
+  if (ahora - ultimoWifiCheck >= 30000)
+  {
+    ultimoWifiCheck = ahora;
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      conectarWiFi();
+    }
+  }
+
+  // Sincronizar pendientes cada 60 segundos si hay WiFi
+  if (WiFi.status() == WL_CONNECTED && pendientesEnNVS > 0 && !sincronizando && (ahora - ultimoSync >= 60000))
+  {
+    ultimoSync = ahora;
+    sincronizarPendientes();
+  }
+
+  // ACTUALIZAR PANTALLA CADA SEGUNDO
+  if (ahora - ultimoDisplay >= OLED_UPDATE_MS)
+  {
+    ultimoDisplay = ahora;
+    mostrarEstado();
   }
 }
 
 // ============================================================
-//  LOOP PRINCIPAL
+//  MEDIR LUZ POR AMPLITUD DE OSCILACIÓN
 // ============================================================
-void loop()
+bool medirLuz()
 {
-  valorADC      = analogRead(PIN_SENSOR);
-  voltajeSalida = (valorADC * 3.3) / 4095.0;
+  valorMaxADC = 0;
+  valorMinADC = 4095;
 
-  Serial.print("[ADC] ");
-  Serial.print(valorADC);
-  Serial.print(" | Voltaje OUT: ");
-  Serial.print(voltajeSalida, 3);
-  Serial.println(" V");
+  unsigned long inicio = millis();
 
-  mostrarEstado();
+  // Tomar muestras durante TIEMPO_MUESTRAS ms
+  while (millis() - inicio < TIEMPO_MUESTRAS)
+  {
+    int lectura = analogRead(PIN_SENSOR);
+    if (lectura > valorMaxADC) valorMaxADC = lectura;
+    if (lectura < valorMinADC) valorMinADC = lectura;
+  }
 
-  delay(150);
+  amplitudADC = valorMaxADC - valorMinADC;
+
+  // Si la amplitud supera el umbral → hay luz
+  return (amplitudADC > UMBRAL_AMPLITUD);
+}
+
+// ============================================================
+//  GUARDAR REGISTRO EN NVS
+// ============================================================
+void guardarEnNVS(String tipo, String hora, unsigned long durSeg, String notas)
+{
+  int total = nvs.getInt("total", 0);
+
+  if (total >= MAX_REGISTROS)
+  {
+    Serial.println("[NVS] Buffer lleno, descartando registro más antiguo");
+
+    for (int i = 0; i < MAX_REGISTROS - 1; i++)
+    {
+      nvs.putString(("tp"  + String(i)).c_str(), nvs.getString(("tp"  + String(i + 1)).c_str(), ""));
+      nvs.putString(("hr"  + String(i)).c_str(), nvs.getString(("hr"  + String(i + 1)).c_str(), ""));
+      nvs.putULong( ("dr"  + String(i)).c_str(), nvs.getULong( ("dr"  + String(i + 1)).c_str(), 0));
+      nvs.putString(("nt"  + String(i)).c_str(), nvs.getString(("nt"  + String(i + 1)).c_str(), ""));
+      nvs.putBool(  ("env" + String(i)).c_str(), nvs.getBool(  ("env" + String(i + 1)).c_str(), false));
+    }
+
+    total = MAX_REGISTROS - 1;
+  }
+
+  String idx = String(total);
+  nvs.putString(("tp"  + idx).c_str(), tipo.c_str());
+  nvs.putString(("hr"  + idx).c_str(), hora.c_str());
+  nvs.putULong( ("dr"  + idx).c_str(), durSeg);
+  nvs.putString(("nt"  + idx).c_str(), notas.c_str());
+  nvs.putBool(  ("env" + idx).c_str(), false);
+  nvs.putInt("total", total + 1);
+
+  pendientesEnNVS = contarPendientes();
+
+  Serial.println("[NVS] Guardado #" + idx + " | " + tipo + " | " + hora);
+}
+
+// ============================================================
+//  SINCRONIZAR PENDIENTES CON GOOGLE SHEETS
+// ============================================================
+void sincronizarPendientes()
+{
+  int total = nvs.getInt("total", 0);
+  if (total == 0) return;
+
+  sincronizando = true;
+  int enviados  = 0;
+  int fallidos  = 0;
+
+  Serial.println("[SYNC] Iniciando sincronización de " + String(total) + " registros...");
+
+  for (int i = 0; i < total; i++)
+  {
+    String envKey    = "env" + String(i);
+    bool   yaEnviado = nvs.getBool(envKey.c_str(), false);
+
+    if (yaEnviado) continue;
+
+    String        tipo  = nvs.getString(("tp" + String(i)).c_str(), "");
+    String        hora  = nvs.getString(("hr" + String(i)).c_str(), "");
+    unsigned long dur   = nvs.getULong( ("dr" + String(i)).c_str(), 0);
+    String        notas = nvs.getString(("nt" + String(i)).c_str(), "");
+
+    if (tipo == "") continue;
+
+    Serial.println("[SYNC] Enviando #" + String(i) + ": " + tipo + " | " + hora);
+
+    mostrarMensaje(
+      "Sincronizando",
+      String(i + 1) + "/" + String(total),
+      tipo == "FALLA_INICIO" ? "Falla: " + hora.substring(11, 16) : "Retorno: " + hora.substring(11, 16)
+    );
+
+    bool ok = enviarAGoogleSheets(tipo, hora, String(dur), notas);
+
+    if (ok)
+    {
+      nvs.putBool(envKey.c_str(), true);
+      enviados++;
+      Serial.println("[SYNC] #" + String(i) + " enviado OK");
+    }
+    else
+    {
+      fallidos++;
+      Serial.println("[SYNC] #" + String(i) + " falló, reintentará luego");
+      break;
+    }
+
+    delay(500);
+  }
+
+  pendientesEnNVS = contarPendientes();
+  sincronizando   = false;
+
+  Serial.println("[SYNC] Completado. Enviados: " + String(enviados) + " | Fallidos: " + String(fallidos) + " | Pendientes: " + String(pendientesEnNVS));
+}
+
+// ============================================================
+//  CONTAR REGISTROS PENDIENTES
+// ============================================================
+int contarPendientes()
+{
+  int total = nvs.getInt("total", 0);
+  int pendientes = 0;
+
+  for (int i = 0; i < total; i++)
+  {
+    bool enviado = nvs.getBool(("env" + String(i)).c_str(), false);
+    if (!enviado) pendientes++;
+  }
+
+  return pendientes;
+}
+
+// ============================================================
+//  CARGAR CONTADORES DE SESIONES ANTERIORES
+// ============================================================
+void cargarContadores()
+{
+  contadorFallas = nvs.getInt("fallasTot", 0);
+  Serial.println("[NVS] Fallas históricas: " + String(contadorFallas));
+}
+
+// ============================================================
+//  ENVIAR DATOS A GOOGLE SHEETS
+// ============================================================
+bool enviarAGoogleSheets(String tipo, String hora, String duracion, String notas)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("[HTTP] Sin WiFi, no se puede enviar");
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient http;
+
+  String url = String(GOOGLE_SCRIPT_URL);
+  url += "?tipo=" + tipo;
+  url += "&hora=" + hora;
+  url += "&duracion=" + duracion;
+  url += "&notas=" + notas;
+  url.replace(" ", "%20");
+
+  Serial.println("[HTTP] Enviando a: " + url.substring(0, 60) + "...");
+
+  http.begin(client, url);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(10000);
+
+  int httpCode = http.GET();
+
+  if (httpCode > 0)
+  {
+    String respuesta = http.getString();
+    Serial.println("[HTTP] Código: " + String(httpCode));
+    Serial.println("[HTTP] Respuesta: " + respuesta);
+    http.end();
+    return (httpCode == 200 || httpCode == 302);
+  }
+  else
+  {
+    Serial.println("[HTTP] Error: " + http.errorToString(httpCode));
+    http.end();
+    return false;
+  }
+}
+
+// ============================================================
+//  CONECTAR WIFI
+// ============================================================
+void conectarWiFi()
+{
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.print("[WiFi] Conectando a " + String(WIFI_SSID));
+  unsigned long inicio = millis();
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - inicio) < RECONNECT_TIMEOUT)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.println("\n[WiFi] Conectado! IP: " + WiFi.localIP().toString());
+    Serial.println("[WiFi] RSSI: " + String(WiFi.RSSI()) + " dBm");
+  }
+  else
+  {
+    Serial.println("\n[WiFi] FALLO al conectar. Continuando sin internet...");
+  }
+}
+
+// ============================================================
+//  OBTENER HORA COMO STRING
+// ============================================================
+String obtenerHora()
+{
+  struct tm timeinfo;
+
+  if (!getLocalTime(&timeinfo))
+  {
+    unsigned long s = millis() / 1000;
+    char buf[20];
+    sprintf(buf, "T+%02lu:%02lu:%02lu", s/3600, (s%3600)/60, s%60);
+    return String(buf);
+  }
+
+  char buf[25];
+  strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buf);
+}
+
+// ============================================================
+//  SEGUNDOS A H:M:S
+// ============================================================
+String segundosAHMS(unsigned long seg)
+{
+  unsigned long h = seg / 3600;
+  unsigned long m = (seg % 3600) / 60;
+  unsigned long s = seg % 60;
+  char buf[12];
+  sprintf(buf, "%02luh%02lum%02lus", h, m, s);
+  return String(buf);
 }
 
 // ============================================================
@@ -108,24 +585,142 @@ void mostrarEstado()
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Título
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.println("=== CALIBRACION ===");
+  if (!luzPresente)
+  {
+    // PANTALLA DE FALLA
 
-  // Valor ADC
-  display.setCursor(0, 16);
-  display.print("ADC (0-4095):");
-  display.setTextSize(2);
+    static bool parpadeo = false;
+    parpadeo = !parpadeo;
+    display.setTextSize(1);
+    display.setCursor(4, 0);
+    if (parpadeo) display.println("SIN ELECTRICIDAD");
+
+    // Contador HH:MM:SS en tamaño grande
+    unsigned long durActual = (millis() - tiempoFalla) / 1000;
+    unsigned long h = durActual / 3600;
+    unsigned long m = (durActual % 3600) / 60;
+    unsigned long s = durActual % 60;
+
+    display.setTextSize(2);
+    display.setCursor(0, 16);
+    char buf[9];
+    sprintf(buf, "%02lu:%02lu:%02lu", h, m, s);
+    display.println(buf);
+
+    display.setTextSize(1);
+    display.setCursor(0, 40);
+    display.print("Desde: ");
+
+    if (horaFalla.length() >= 19)
+    {
+      display.println(horaFalla.substring(11, 16));
+    }
+    else
+    {
+      display.println(horaFalla);
+    }
+
+    display.setCursor(0, 52);
+    display.print("F#");
+    display.print(contadorFallas);
+    display.print(" ");
+
+    if (pendientesEnNVS > 0)
+    {
+      display.print("NVS:");
+      display.print(pendientesEnNVS);
+    }
+    else
+    {
+      display.println(WiFi.status() == WL_CONNECTED ? "WiFi SI" : "Sin WiFi");
+    }
+  }
+  else
+  {
+    // PANTALLA NORMAL
+
+    display.setTextSize(1);
+    display.setCursor(4, 0);
+    display.println("HAY ELECTRICIDAD");
+
+    // Hora actual
+    display.setCursor(40, 18);
+    String hora = obtenerHora();
+
+    if (hora.length() >= 19)
+    {
+      display.setTextSize(1);
+      display.println(hora.substring(11));
+    }
+    else
+    {
+      display.println(hora);
+    }
+
+    // Última falla y su duración
+    display.setCursor(0, 30);
+
+    if (horaFalla != "" && duracionFalla > 0)
+    {
+      display.print("Ult falla: ");
+
+      if (horaFalla.length() >= 19)
+      {
+        display.println(horaFalla.substring(11, 16));
+      }
+      else
+      {
+        display.println(horaFalla);
+      }
+
+      display.setCursor(0, 42);
+      display.print("Duracion:  ");
+      display.println(duracionStr);
+    }
+    else
+    {
+      display.println("Sin fallas");
+    }
+
+    // WiFi, pendientes y contador
+    display.setCursor(0, 54);
+
+    if (pendientesEnNVS > 0)
+    {
+      display.print("Pendientes NVS: ");
+      display.println(pendientesEnNVS);
+    }
+    else if (WiFi.status() == WL_CONNECTED)
+    {
+      display.print("WiFi SI | F:");
+      display.println(contadorFallas);
+    }
+    else
+    {
+      display.println("WiFi: SIN CONEXION");
+    }
+  }
+
+  display.display();
+}
+
+// ============================================================
+//  MOSTRAR MENSAJE EN OLED
+// ============================================================
+void mostrarMensaje(String linea1, String linea2, String linea3)
+{
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setTextSize(1);
+  display.setCursor(0, 10);
+  display.println(linea1);
+
   display.setCursor(0, 28);
-  display.println(valorADC);
+  display.println(linea2);
 
-  // Voltaje en el pin OUT
-  display.setTextSize(1);
-  display.setCursor(0, 50);
-  display.print("Voltaje OUT: ");
-  display.print(voltajeSalida, 2);
-  display.println(" V");
+  display.setCursor(0, 46);
+  display.println(linea3);
 
   display.display();
 }
