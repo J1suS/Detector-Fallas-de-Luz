@@ -1,13 +1,32 @@
 /*
  * ============================================================
-  GOOGLE APPS SCRIPT - Receptor de datos del ESP32C3
+  GOOGLE APPS SCRIPT - Receptor y proveedor de datos del ESP32C3
   Detector de Falla de Luz - Venezuela
-  Versión 2.0 - Estadísticas automáticas
+  Versión 3.0 - Endpoint de lectura para la app web (+CORS)
 
   Hojas generadas automáticamente:
   - "Registro de Fallas" → todos los eventos raw
   - "Resumen" → estadísticas generales
   - "Estadísticas" → promedio semanal y franja horaria
+
+  ENDPOINTS (mismo doGet, diferenciados por ?accion=):
+  - Sin "accion" o accion=registrar  → usado por el Arduino para
+    guardar un evento (comportamiento original, sin cambios).
+    Ej: ?tipo=FALLA_INICIO&hora=...&duracion=0&notas=...
+  - accion=obtenerDatos              → usado por la app web para
+    leer el historial + resumen en JSON.
+    Ej: ?accion=obtenerDatos
+
+  CORS:
+  Los Web Apps de Apps Script desplegados con "Quién tiene acceso:
+  Cualquier persona" ya responden a peticiones GET cross-origin
+  (la redirección a script.googleusercontent.com incluye
+  Access-Control-Allow-Origin: *). No existe un método setHeaders()
+  en ContentService.TextOutput, así que no hace falta (ni es
+  posible) fijarlo manualmente. Si en el navegador aparece un error
+  de CORS, casi siempre es porque la implementación es vieja: hay
+  que ir a Implementar → Gestionar implementaciones → Editar →
+  Nueva versión, para que la URL sirva el código actualizado.
 
   INSTRUCCIONES DE INSTALACIÓN:
   1. Ir a https://sheets.google.com y crear una hoja nueva
@@ -37,11 +56,20 @@ var FRANJAS = [
   { nombre: "Noche",     inicio: 18, fin: 23 }
 ];
 
-// Recibir las peticiones GET del ESP32
+// Recibir las peticiones GET. Diferencia Arduino (escribir) de la web (leer)
 function doGet(e)
 {
   try
   {
+    var accion = (e.parameter.accion || "registrar").toLowerCase();
+
+    // ---- LECTURA: la app web pide el historial ----
+    if (accion === "obtenerdatos")
+    {
+      return obtenerDatos();
+    }
+
+    // ---- ESCRITURA: comportamiento original del Arduino ----
     var tipo     = e.parameter.tipo     || "DESCONOCIDO";
     var hora     = e.parameter.hora     || "Sin hora";
     var duracion = e.parameter.duracion || "0";
@@ -69,6 +97,85 @@ function doGet(e)
       }))
       .setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+// Devuelve el historial + un resumen numérico en JSON, para la app web.
+// Los valores de duración van en segundos (no en texto "Xh Ym Zs") para
+// que la web los formatee como necesite (idioma, unidades, gráficas, etc).
+function obtenerDatos()
+{
+  var ss   = SpreadsheetApp.getActiveSpreadsheet();
+  var hoja = ss.getSheetByName(NOMBRE_HOJA);
+
+  var registros = [];
+  var resumen = {
+    totalFallas:          0,
+    fallasCompletas:      0,
+    duracionPromedioSeg:  0,
+    duracionMaximaSeg:    0,
+    tiempoTotalSinLuzSeg: 0,
+    ultimaFalla:          ""
+  };
+
+  if (hoja && hoja.getLastRow() > 1)
+  {
+    var datos = hoja.getDataRange().getValues();
+    var sumaSegundos        = 0;
+    var duracionesCompletas = 0;
+
+    for (var i = 1; i < datos.length; i++)
+    {
+      var fila = datos[i];
+
+      registros.push({
+        n:               fila[0],
+        tipo:            fila[1],
+        horaDispositivo: fila[2],
+        horaServidor:    fila[3],
+        duracionSeg:     fila[4],
+        duracionTexto:   fila[5],
+        notas:           fila[6]
+      });
+
+      var tipoFila = fila[1];
+      var durSeg   = parseInt(fila[4]) || 0;
+
+      if (tipoFila === "FALLA_INICIO")
+      {
+        resumen.totalFallas++;
+        resumen.ultimaFalla = fila[2];
+      }
+
+      if (tipoFila === "FALLA_FIN" && durSeg > 0)
+      {
+        duracionesCompletas++;
+        sumaSegundos += durSeg;
+        if (durSeg > resumen.duracionMaximaSeg)
+        {
+          resumen.duracionMaximaSeg = durSeg;
+        }
+      }
+    }
+
+    resumen.fallasCompletas      = duracionesCompletas;
+    resumen.duracionPromedioSeg  = duracionesCompletas > 0
+      ? Math.floor(sumaSegundos / duracionesCompletas)
+      : 0;
+    resumen.tiempoTotalSinLuzSeg = sumaSegundos;
+  }
+
+  // Limitar lo enviado a la web para que la respuesta no crezca sin control
+  var registrosRecientes = registros.slice(-100);
+
+  return ContentService
+    .createTextOutput(JSON.stringify({
+      status:         "OK",
+      actualizado:    Utilities.formatDate(new Date(), "America/Caracas", "yyyy-MM-dd HH:mm:ss"),
+      totalRegistros: registros.length,
+      registros:      registrosRecientes,
+      resumen:        resumen
+    }))
+    .setMimeType(ContentService.MimeType.JSON);
 }
 
 // Guardar registro en la hoja
@@ -512,6 +619,11 @@ function probarScript()
     }
   };
   doGet(e4);
+
+  // Probar el endpoint de lectura que usará la app web
+  var e5 = { parameter: { accion: "obtenerDatos" } };
+  var respuesta = doGet(e5);
+  Logger.log(respuesta.getContent());
 
   Logger.log("Prueba completada. Revisa las hojas de cálculo.");
 }
